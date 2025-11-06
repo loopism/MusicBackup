@@ -3,6 +3,9 @@ This script can either be run interactively or from Task Scheduler.
 It uses robocopy to copy files that are not on the remote share or have been changed locally
 and will log the output in a file then email a summary.
 
+Email credentials are stored securely using Windows Data Protection API (DPAPI), the script will prompt for
+credentials on the first run.
+
 Interactive usage:
 	powershell.exe -ExecutionPolicy Bypass -File "Path\To\music_backup.ps1" 
 

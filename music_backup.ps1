@@ -23,6 +23,9 @@
         1.3 - Added command-line switches for -DryRun and -NoEmail
         1.4 - Improved logging format and summary
         1.5 - Added alternate user support for network share access
+        1.6 - Enhanced email function - email credentials are now stored securely, the script will prompt for setup on first run
+            - Added TLS 1.2 enforcement for SMTP connections
+            - Improved folder list handling to ignore comments and empty lines
 #>
 
 
@@ -32,8 +35,31 @@ param (
     [switch]$AltUser
 )
 
-# Default destination root
-$destRoot = "\\vault\Music"
+# Check if running interactively and credential file doesn't exist
+$emailCredPath = "$PSScriptRoot\email_cred.xml"
+if (($Host.Name -eq "ConsoleHost") -and !(Test-Path $emailCredPath)) {
+    Write-Host "`n=== First Run Email Credential Setup ==="
+    Write-Host "No email credential file found. Let's create one."
+    Write-Host "Note: Use an App Password if 2FA is enabled on your Gmail account"
+    Write-Host "Generate one at: https://myaccount.google.com/apppasswords"
+    
+    $emailUser = Read-Host "Enter Gmail address"
+    $emailPass = Read-Host "Enter Gmail App Password" -AsSecureString
+    
+    # Create credential object and export
+    $emailCred = New-Object PSCredential($emailUser, $emailPass)
+    $emailCred | Export-Clixml -Path $emailCredPath
+    
+    # Set strict file permissions
+    $acl = Get-Acl $emailCredPath
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "$env:USERDOMAIN\$env:USERNAME", "Read", "Allow")
+    $acl.AddAccessRule($rule)
+    Set-Acl $emailCredPath $acl
+    
+    Write-Host "Credential file created and secured at: $emailCredPath`n"
+}
 
 # If alternate user is requested, map network share
 # Need to run the following from an interactive PowerShell console first:
@@ -53,7 +79,7 @@ if ($AltUser) {
 
         # Map the share using stored credentials
         New-PSDrive -Name $mappedDrive -PSProvider FileSystem -Root $sharePath -Credential $cred -Persist | Out-Null
-        $destRoot = "$mappedDrive:\"
+        $destRoot = "$mappedDrive\"
     } else {
         Write-Error "Credential file not found at $credPath. Run the setup command to create it."
         exit 1
@@ -67,7 +93,21 @@ function Write-Log {
         [string]$Message,
         [string]$Path
     )
-    $Message | Out-File -FilePath $Path -Append -Encoding utf8
+    # UTF-8 encoding without BOM
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    
+    # Ensure directory exists
+    $logDir = Split-Path -Parent $Path
+    if (!(Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    
+    # Write to file using .NET directly for consistent UTF-8 handling
+    if (Test-Path $Path) {
+        [System.IO.File]::AppendAllText($Path, $Message + [Environment]::NewLine, $utf8NoBom)
+    } else {
+        [System.IO.File]::WriteAllText($Path, $Message + [Environment]::NewLine, $utf8NoBom)
+    }
 }
 
 # Set script root and log directory
@@ -77,7 +117,7 @@ if (!(Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory }
 
 # Generate timestamped log file
 $timestamp = Get-Date -Format "dd-MM-yyyy_HH-mm-ss"
-$logFile = Join-Path $logDir "robocopy_$timestamp.txt"
+$logFile = "$logDir\robocopy_$timestamp.txt"
 
 # Define destination root
 $destRoot = "\\vault\Music"
@@ -118,8 +158,11 @@ $failedFolders = @()
 # Start log
 Write-Log "=== Robocopy Sync Started: $timestamp ===" $logFile
 
-# Read folders.txt
-$folderList = Get-Content "$scriptRoot\folders.txt"
+# Read folders.txt and ignore comment lines
+$folderList = Get-Content "$scriptRoot\folders.txt" | Where-Object {
+    $_.Trim() -ne "" -and  # Skip empty lines
+    -not $_.StartsWith("#") # Skip comment lines
+}
 
 foreach ($sourcePath in $folderList) {
     if (Test-Path $sourcePath) {
@@ -138,7 +181,7 @@ foreach ($sourcePath in $folderList) {
 
         $robocopyArgs += $excludeArgs
         $cmd = "robocopy " + ($robocopyArgs -join " ")
-        $result = Invoke-Expression $cmd
+        Invoke-Expression $cmd
         $exitCode = $LASTEXITCODE
 
         if ($exitCode -lt 8) {
@@ -182,27 +225,41 @@ if ($failedCount -gt 0) {
 }
 
 $body += "`nSee attached log for full details."
+
 # Send email alert via Gmail unless -NoEmail set
 if (-not ($NoEmail)) {
     $smtpServer = "smtp.gmail.com"
     $smtpPort = 587
-    $from = "serverlogging.allservers@gmail.com"
-    $to = "rbyrnes@gmail.com"
-    $subjectPrefix = if ($dryRun) { "[DRY RUN] " } else { "" }
-    if ($failedCount -gt 0) {
-        $subject = "$subjectPrefix❌ Robocopy Sync FAILED"
-    } else {
-        $subject = "$subjectPrefix✅ Robocopy Sync Completed"
+    
+    # Load credentials from file
+    if (Test-Path $emailCredPath) {
+        $emailCred = Import-Clixml -Path $emailCredPath
+        $from = $emailCred.UserName
+        $to = "rbyrnes@gmail.com"  # Keep your existing recipient
+        
+        $subjectPrefix = if ($DryRun) { "[DRY RUN] " } else { "" }
+        if ($failedCount -gt 0) {
+            $subject = "$subjectPrefix[FAILED] Robocopy Sync"
+        } else {
+            $subject = "$subjectPrefix[SUCCESS] Robocopy Sync"
+        }
+        
+        # Add this before the Send-MailMessage command:
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+        try {
+            Send-MailMessage -From $from -To $to -Subject $subject -Body $body `
+                -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $emailCred `
+                -Attachments $logFile
+        }
+        catch {
+            Write-Error "Failed to send email: $_"
+        }
+    }
+    else {
+        Write-Error "Email credential file not found at: $emailCredPath"
     }
 }
-
-# Secure password (use App Password if 2FA is enabled)
-$securePassword = ConvertTo-SecureString "igad jcdx amat axyf" -AsPlainText -Force
-$cred = New-Object System.Management.Automation.PSCredential ($from, $securePassword)
-
-Send-MailMessage -From $from -To $to -Subject $subject -Body $body `
-    -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $cred `
-    -Attachments $logFile
 
 # Cleanup mapped drive
 if ($AltUser) {
