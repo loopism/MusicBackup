@@ -13,8 +13,8 @@
 	- Logs are saved in the 'logs' subfolder
 	- Email alerts use Gmail SMTP (App Password recommended)
 
-    Version: 1.5
-    Last Updated: 2025-11-05
+    Version: 1.7
+    Last Updated: 2025-11-20
 
     Changelog:
         1.0 - Initial PowerShell conversion from batch (https://www.ubackup.com/synchronization/robocopy-multiple-folders-6007-rc.html)
