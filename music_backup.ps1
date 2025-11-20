@@ -26,6 +26,7 @@
         1.6 - Enhanced email function - email credentials are now stored securely, the script will prompt for setup on first run
             - Added TLS 1.2 enforcement for SMTP connections
             - Improved folder list handling to ignore comments and empty lines
+        1.7 - Added copied files tracking and attachment to email summary
 #>
 
 
@@ -69,23 +70,35 @@ if (($Host.Name -eq "ConsoleHost") -and !(Test-Path $emailCredPath)) {
 
 if ($AltUser) {
     $credPath = "D:\MusicBackup\music_backup_password.xml"
-    $username = "OtherUser"  # or  "DOMAIN\OtherUser" if not local
     $sharePath = "\\vault\Music"
-    $mappedDrive = "MusicShare"
 
-    if (Test-Path $credPath) {
-        $securePassword = Import-Clixml -Path $credPath
-        $cred = New-Object System.Management.Automation.PSCredential ($username, $securePassword)
+    function Get-FreeDriveLetter {
+        param([string]$Preferred = "Z")
+        $used = @()
+        Get-PSDrive -PSProvider FileSystem | ForEach-Object { $used += $_.Name.ToUpper() }
+        [System.IO.DriveInfo]::GetDrives() | ForEach-Object { $used += $_.Name.Substring(0,1).ToUpper() }
+        $candidates = @()
+        if ($Preferred) { $candidates += $Preferred.Substring(0,1).ToUpper() }
+        for ($i=[int][char]'Z'; $i -ge [int][char]'D'; $i--) { $candidates += [char]$i }
+        foreach ($letter in $candidates) { if (-not ($used -contains $letter)) { return $letter } }
+        return $null
+    }
 
-        # Map the share using stored credentials
-        New-PSDrive -Name $mappedDrive -PSProvider FileSystem -Root $sharePath -Credential $cred -Persist | Out-Null
-        $destRoot = "$mappedDrive\"
-    } else {
+    $mappedDrive = Get-FreeDriveLetter -Preferred "Z"
+    if (-not $mappedDrive) {
+        Write-Error "No free drive letters available. Aborting."
+        exit 1
+    }
+
+    if (-not (Test-Path $credPath)) {
         Write-Error "Credential file not found at $credPath. Run the setup command to create it."
         exit 1
     }
-}
+    $cred = Import-Clixml -Path $credPath
 
+    New-PSDrive -Name $mappedDrive -PSProvider FileSystem -Root $sharePath -Credential $cred -Persist | Out-Null
+    $destRoot = "${mappedDrive}:\"
+}
 
 # Helper function for UTF-8 logging
 function Write-Log {
@@ -155,6 +168,10 @@ $skippedCount = 0
 $failedCount = 0
 $failedFolders = @()
 
+# NEW: track copied files across runs
+$copiedFiles = @()
+$runIndex = 0
+
 # Start log
 Write-Log "=== Robocopy Sync Started: $timestamp ===" $logFile
 
@@ -166,13 +183,18 @@ $folderList = Get-Content "$scriptRoot\folders.txt" | Where-Object {
 
 foreach ($sourcePath in $folderList) {
     if (Test-Path $sourcePath) {
+        $runIndex++
         $relativePath = $sourcePath.Substring(3)
         $destPath = Join-Path $destRoot $relativePath
+
+        # Per-run robocopy log so we can extract copied files
+        $runLog = Join-Path $logDir ("robocopy_run_{0}_{1}.txt" -f $timestamp, $runIndex)
 
         $excludeArgs = $excludes | ForEach-Object { "/XF `"$($_)`"" }
         $robocopyArgs = @(
             "`"$sourcePath`"", "`"$destPath`"",
-            "/MT", "/E", "/XO", "/FFT", "/V", "/NDL", "/NFL"
+            "/MT", "/E", "/XO", "/FFT", "/V", "/NDL", "/NFL",
+            "/FP", "/TS", "/LOG:`"$runLog`""    # /FP = full path, /TS = timestamp, /LOG writes run log
         )
 
         if ($DryRun) {
@@ -184,13 +206,31 @@ foreach ($sourcePath in $folderList) {
         Invoke-Expression $cmd
         $exitCode = $LASTEXITCODE
 
+        # If successful-ish, extract copied file lines from the run log
         if ($exitCode -lt 8) {
             $copiedCount++
             Write-Log "Copied: $sourcePath → $destPath (Exit Code: $exitCode)" $logFile
+
+            if (Test-Path $runLog) {
+                # Extract lines that look like full paths (drive letter or UNC). Trim them.
+                Get-Content $runLog | ForEach-Object {
+                    if ($_ -match '^\s*([A-Za-z]:\\|\\\\).+') {
+                        $copiedFiles += $_.Trim()
+                    }
+                }
+            }
         } else {
             $failedCount++
             $failedFolders += $sourcePath
             Write-Log "FAILED: $sourcePath → $destPath (Exit Code: $exitCode)" $logFile
+            if (Test-Path $runLog) {
+                # still capture any file lines for debugging
+                Get-Content $runLog | ForEach-Object {
+                    if ($_ -match '^\s*([A-Za-z]:\\|\\\\).+') {
+                        $copiedFiles += $_.Trim()
+                    }
+                }
+            }
         }
     } else {
         $skippedCount++
@@ -226,6 +266,16 @@ if ($failedCount -gt 0) {
 
 $body += "`nSee attached log for full details."
 
+# NEW: write combined copied-files attachment
+$copiedFilesFile = Join-Path $logDir ("copied_files_{0}.txt" -f $timestamp)
+if ($copiedFiles.Count -gt 0) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllLines($copiedFilesFile, $copiedFiles, $utf8NoBom)
+} else {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($copiedFilesFile, "No files copied during this run." + [Environment]::NewLine, $utf8NoBom)
+}
+
 # Send email alert via Gmail unless -NoEmail set
 if (-not ($NoEmail)) {
     $smtpServer = "smtp.gmail.com"
@@ -244,13 +294,14 @@ if (-not ($NoEmail)) {
             $subject = "$subjectPrefix[SUCCESS] Robocopy Sync"
         }
         
-        # Add this before the Send-MailMessage command:
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
         try {
+            # Attach both the main log and the copied-files list
+            $attachments = @($logFile, $copiedFilesFile)
             Send-MailMessage -From $from -To $to -Subject $subject -Body $body `
                 -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $emailCred `
-                -Attachments $logFile
+                -Attachments $attachments
         }
         catch {
             Write-Error "Failed to send email: $_"
@@ -262,6 +313,10 @@ if (-not ($NoEmail)) {
 }
 
 # Cleanup mapped drive
-if ($AltUser) {
-    Remove-PSDrive -Name "MusicShare"
+if ($AltUser -and $mappedDrive) {
+    try {
+        Remove-PSDrive -Name $mappedDrive -Force -ErrorAction Stop
+    } catch {
+        Write-Log "Warning: failed to remove PSDrive ${mappedDrive}: $_" $logFile
+    }
 }
