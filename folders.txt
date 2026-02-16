@@ -1,5 +1,5 @@
 # Music folders to backup
 D:\Music\Rock
-D:\Music\Jazz
+D:\Music\New Wave
 # Temporary disabled
 #D:\Music\Classical

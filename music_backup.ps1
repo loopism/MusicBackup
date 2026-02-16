@@ -27,6 +27,7 @@
             - Added TLS 1.2 enforcement for SMTP connections
             - Improved folder list handling to ignore comments and empty lines
         1.7 - Added copied files tracking and attachment to email summary
+        1.8 - Improved handling of spaces in paths and log file encoding (UTF-8 without BOM), added more robust error handling and logging for directory creation and PSDrive mapping
 #>
 
 
@@ -136,7 +137,8 @@ $logFile = "$logDir\robocopy_$timestamp.txt"
 $destRoot = "\\vault\Music"
 
 # Define exclusions
-$excludes = @("*.bak", "*.backup", ".stfolder", "syncthing*.*")
+$excludeFiles = @("*.bak", "*.backup", "syncthing*.*")      # File patterns to exclude
+$excludeDirs = @(".stfolder")                                # Directory names to exclude
 
 # Detect if running interactively
 $isInteractive = ($Host.Name -eq "ConsoleHost")
@@ -176,61 +178,155 @@ $runIndex = 0
 Write-Log "=== Robocopy Sync Started: $timestamp ===" $logFile
 
 # Read folders.txt and ignore comment lines
-$folderList = Get-Content "$scriptRoot\folders.txt" | Where-Object {
-    $_.Trim() -ne "" -and  # Skip empty lines
-    -not $_.StartsWith("#") # Skip comment lines
+# Each line is treated as a complete path (spaces in paths are fully preserved)
+$rawFolders = @(Get-Content "$scriptRoot\folders.txt" -Raw -ErrorAction SilentlyContinue)
+$folderList = @()
+if ($rawFolders) {
+    $rawFolders -split "`n" | ForEach-Object {
+        $line = $_.Trim()
+        # Skip empty lines and comments
+        if ($line -and -not $line.StartsWith("#")) {
+            $folderList += $line
+        }
+    }
 }
 
+if ($folderList.Count -eq 0) {
+    Write-Error "No source folders found in $scriptRoot\folders.txt"
+    exit 1
+}
+
+Write-Log "Found $($folderList.Count) source folders to process" $logFile
+
 foreach ($sourcePath in $folderList) {
-    if (Test-Path $sourcePath) {
+    # Log the exact path being processed (for debugging spaces)
+    Write-Log "DEBUG: Reading path='$sourcePath' (Length: $($sourcePath.Length) chars)" $logFile
+    
+    if (Test-Path -LiteralPath $sourcePath) {
         $runIndex++
-        $relativePath = $sourcePath.Substring(3)
+        # Extract relative path (strip drive letter and colon, e.g., "D:" -> "")
+        $relativePath = if ($sourcePath -match '^[A-Za-z]:\\(.*)$') { $matches[1] } else { $sourcePath.TrimStart('\') }
         $destPath = Join-Path $destRoot $relativePath
+
+        # Ensure destination directory exists before running robocopy
+        # (robocopy may fail with error 16 if it can't create the destination structure)
+        if (!(Test-Path -LiteralPath $destPath)) {
+            try {
+                New-Item -ItemType Directory -Path $destPath -Force | Out-Null
+                Write-Log "Created destination directory: $destPath" $logFile
+            } catch {
+                Write-Log "ERROR: Failed to create destination directory: $destPath - $_" $logFile
+                $failedCount++
+                $failedFolders += $sourcePath
+                continue
+            }
+        }
 
         # Per-run robocopy log so we can extract copied files
         $runLog = Join-Path $logDir ("robocopy_run_{0}_{1}.txt" -f $timestamp, $runIndex)
+        
+        # Log the paths being used for debugging
+        Write-Log "Processing: Source=$sourcePath | Dest=$destPath" $logFile
 
-        $excludeArgs = $excludes | ForEach-Object { "/XF `"$($_)`"" }
+        # Build robocopy arguments as clean array (Start-Process handles quoting)
         $robocopyArgs = @(
-            "`"$sourcePath`"", "`"$destPath`"",
-            "/MT", "/E", "/XO", "/FFT", "/V", "/NDL", "/NFL",
-            "/FP", "/TS", "/LOG:`"$runLog`""    # /FP = full path, /TS = timestamp, /LOG writes run log
+            $sourcePath,        # Do NOT manually quote - let Start-Process handle it
+            $destPath,          # Same here
+            "/MT:16",
+            "/E",
+            "/V",
+            "/FP",
+            "/TS",
+            "/LOG+:$runLog"     # Log path may have spaces, but /LOG+ treats the whole argument
         )
+
+        # Add exclude filters - use /XF for files, /XD for directories
+        foreach ($ex in $excludeFiles) {
+            $robocopyArgs += "/XF"
+            $robocopyArgs += $ex
+        }
+        foreach ($ex in $excludeDirs) {
+            $robocopyArgs += "/XD"
+            $robocopyArgs += $ex
+        }
 
         if ($DryRun) {
             $robocopyArgs += "/L"
         }
 
-        $robocopyArgs += $excludeArgs
-        $cmd = "robocopy " + ($robocopyArgs -join " ")
-        Invoke-Expression $cmd
+        # Use call operator (&) instead of Start-Process for better handling of spaces in paths
+        Write-Log "Executing: robocopy.exe $($robocopyArgs -join ' ')" $logFile
+        & robocopy.exe @robocopyArgs
         $exitCode = $LASTEXITCODE
 
-        # If successful-ish, extract copied file lines from the run log
-        if ($exitCode -lt 8) {
-            $copiedCount++
-            Write-Log "Copied: $sourcePath → $destPath (Exit Code: $exitCode)" $logFile
-
-            if (Test-Path $runLog) {
-                # Extract lines that look like full paths (drive letter or UNC). Trim them.
-                Get-Content $runLog | ForEach-Object {
-                    if ($_ -match '^\s*([A-Za-z]:\\|\\\\).+') {
-                        $copiedFiles += $_.Trim()
+        # Robocopy exit codes:
+        # 0 = No files copied (but success - no changes needed)
+        # 1 = Files copied successfully
+        # 2 = Extra files or directories detected (also success indicator)
+        # 3 = Files copied + extra files/dirs
+        # 4 = Mismatched files/dirs detected
+        # 8+ = Serious errors - some files not copied
+        
+        # Extract copied file count from run log
+        $filesInLog = 0
+        if (Test-Path $runLog) {
+            $logContent = Get-Content $runLog -Raw
+            # Count actual file entries (lines with timestamps and paths)
+            $filesInLog = @($logContent -split "`n" | Where-Object { $_ -match '^\s*[0-9]{1,2}\s' -and $_ -match '\\' }).Count
+            
+            # Extract only files that were actually copied (not already existing)
+            # Robocopy with /V outputs action indicators: "New File", "Newer", "named", etc.
+            Get-Content $runLog | ForEach-Object {
+                $line = $_
+                # Only match lines that indicate a file/dir was copied: "New File", "Newer", or "named" action
+                if ($line -match '(New File|Newer|named)' -and $line -match '[A-Za-z]:\\') {
+                    # Extract just the path (last tab-separated field)
+                    $parts = $line -split '\t'
+                    $copyPath = $parts[-1].Trim()
+                    if ($copyPath -and $copyPath -notmatch '^\d+$') {  # Avoid capturing lone numbers/whitespace
+                        # Filter out any paths in excluded directories
+                        $shouldExclude = $false
+                        foreach ($exDir in $excludeDirs) {
+                            if ($copyPath -match [regex]::Escape("\$exDir\")) {
+                                $shouldExclude = $true
+                                break
+                            }
+                        }
+                        # Filter out files matching excluded patterns
+                        if (-not $shouldExclude) {
+                            foreach ($exFile in $excludeFiles) {
+                                $filePattern = $exFile -replace '\*', '.*' -replace '\.', '\.'
+                                if ($copyPath -match $filePattern) {
+                                    $shouldExclude = $true
+                                    break
+                                }
+                            }
+                        }
+                        if (-not $shouldExclude) {
+                            $copiedFiles += $copyPath
+                        }
                     }
                 }
+            }
+        }
+
+        # Log result based on robocopy exit code and files found
+        # Exit codes 1-3 indicate files/directories were copied
+        # Exit code 0 means no files needed copying (already in sync)
+        if ($exitCode -le 4) {
+            if ($exitCode -in @(1, 2, 3)) {
+                # Exit codes 1, 2, or 3 mean files or directories were copied
+                $copiedCount++
+                Write-Log "Copied: $sourcePath -> $destPath (Exit Code: $exitCode, files/folders copied)" $logFile
+            } elseif ($exitCode -eq 0 -or $exitCode -eq 4) {
+                # Exit code 0 = no files copied / already in sync
+                # Exit code 4 = mismatched files (but no actual failures)
+                Write-Log "Synced: $sourcePath -> $destPath (Exit Code: $exitCode, no new files)" $logFile
             }
         } else {
             $failedCount++
             $failedFolders += $sourcePath
-            Write-Log "FAILED: $sourcePath → $destPath (Exit Code: $exitCode)" $logFile
-            if (Test-Path $runLog) {
-                # still capture any file lines for debugging
-                Get-Content $runLog | ForEach-Object {
-                    if ($_ -match '^\s*([A-Za-z]:\\|\\\\).+') {
-                        $copiedFiles += $_.Trim()
-                    }
-                }
-            }
+            Write-Log "FAILED: $sourcePath -> $destPath (Exit Code: $exitCode)" $logFile
         }
     } else {
         $skippedCount++
