@@ -28,6 +28,7 @@
             - Improved folder list handling to ignore comments and empty lines
         1.7 - Added copied files tracking and attachment to email summary
         1.8 - Improved handling of spaces in paths and log file encoding (UTF-8 without BOM), added more robust error handling and logging for directory creation and PSDrive mapping
+        1.9 - Added per-run robocopy logs to extract copied files, improved filtering of copied files to exclude those matching excluded patterns, and enhanced email summary with list of copied files and failed folders. Also added more detailed logging for debugging purposes.
 #>
 
 
@@ -138,7 +139,7 @@ $destRoot = "\\vault\Music"
 
 # Define exclusions
 $excludeFiles = @("*.bak", "*.backup", "syncthing*.*")      # File patterns to exclude
-$excludeDirs = @(".stfolder")                                # Directory names to exclude
+$excludeDirs = @(".stfolder")                               # Directory names to exclude
 
 # Detect if running interactively
 $isInteractive = ($Host.Name -eq "ConsoleHost")
@@ -267,14 +268,8 @@ foreach ($sourcePath in $folderList) {
         # 4 = Mismatched files/dirs detected
         # 8+ = Serious errors - some files not copied
         
-        # Extract copied file count from run log
-        $filesInLog = 0
+        # Extract only files that were actually copied (not already existing)
         if (Test-Path $runLog) {
-            $logContent = Get-Content $runLog -Raw
-            # Count actual file entries (lines with timestamps and paths)
-            $filesInLog = @($logContent -split "`n" | Where-Object { $_ -match '^\s*[0-9]{1,2}\s' -and $_ -match '\\' }).Count
-            
-            # Extract only files that were actually copied (not already existing)
             # Robocopy with /V outputs action indicators: "New File", "Newer", "named", etc.
             Get-Content $runLog | ForEach-Object {
                 $line = $_
