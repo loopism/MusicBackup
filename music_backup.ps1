@@ -47,6 +47,17 @@ param (
     [string]$Destination = "\\vault\Music"   # base destination (UNC or drive letter)
 )
 
+# normalize double‑hyphen switches so that --DryRun etc behave like -DryRun
+# this allows Unix-style invocation without breaking normal parameter binding
+foreach ($raw in $args) {
+    switch -Regex ($raw) {
+        '^--DryRun$'    { $DryRun = $true }
+        '^--NoEmail$'   { $NoEmail = $true }
+        '^--AltUser$'   { $AltUser = $true }
+        '^--Destination=(.+)' { $Destination = $Matches[1] }
+    }
+}
+
 # Display help if run interactively with no parameters
 if (($Host.Name -eq "ConsoleHost") -and -not $DryRun -and -not $NoEmail -and -not $AltUser -and $Destination -eq "\\vault\Music") {
     Write-Host "`n" @"
