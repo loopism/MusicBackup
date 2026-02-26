@@ -7,35 +7,41 @@
 	-DryRun    : simulates backup run without copying files
 	-NoEmail   : suppresses email alerts
     -AltUser   : use alternate user credentials for network share access
+    -Destination <path> : specify a custom destination root (UNC or drive); defaults to \\vault\Music
 
     Notes:
 	- Requires folders.txt in the same directory
 	- Logs are saved in the 'logs' subfolder
-	- Email alerts use Gmail SMTP (App Password recommended)
+	- Email alerts use Gmail SMTP (App Password required if 2FA enabled)
 
-    Version: 1.7
+    Version: 0.10
     Last Updated: 2025-11-20
 
     Changelog:
-        1.0 - Initial PowerShell conversion from batch (https://www.ubackup.com/synchronization/robocopy-multiple-folders-6007-rc.html)
-        1.1 - Added email alerts and logging
-        1.2 - Added dry-run mode and interactive detection
-        1.3 - Added command-line switches for -DryRun and -NoEmail
-        1.4 - Improved logging format and summary
-        1.5 - Added alternate user support for network share access
-        1.6 - Enhanced email function - email credentials are now stored securely, the script will prompt for setup on first run
+        0.01 - Initial PowerShell conversion from batch (https://www.ubackup.com/synchronization/robocopy-multiple-folders-6007-rc.html)
+        0.02 - Added email alerts and logging
+        0.03 - Added dry-run mode and interactive detection
+        0.04 - Added command-line switches for -DryRun and -NoEmail
+        0.05 - Improved logging format and summary
+        0.06 - Added alternate user support for network share access
+        0.07 - Enhanced email function - email credentials are now stored securely, the script will prompt for setup on first run
             - Added TLS 1.2 enforcement for SMTP connections
             - Improved folder list handling to ignore comments and empty lines
-        1.7 - Added copied files tracking and attachment to email summary
-        1.8 - Improved handling of spaces in paths and log file encoding (UTF-8 without BOM), added more robust error handling and logging for directory creation and PSDrive mapping
-        1.9 - Added per-run robocopy logs to extract copied files, improved filtering of copied files to exclude those matching excluded patterns, and enhanced email summary with list of copied files and failed folders. Also added more detailed logging for debugging purposes.
-#>
+        0.08 - Added copied files tracking and attachment to email summary
+        0.09 - Improved handling of spaces in paths and log file encoding (UTF-8 without BOM)
+            - added more robust error handling and logging for directory creation and PSDrive mapping
+        0.10 - Added per-run robocopy logs to extract copied files
+            - improved filtering of copied files to exclude those matching excluded patterns
+            - enhanced email summary with list of copied files and failed folders.
+        1.00 - Added switch for custom destination path, updated documentation and renumbered changelog to reflect feature completeness. This script is now considered stable for regular use.
+        #>
 
 
 param (
     [switch]$DryRun,
     [switch]$NoEmail,
-    [switch]$AltUser
+    [switch]$AltUser,
+    [string]$Destination = "\\vault\Music"   # base destination (UNC or drive letter)
 )
 
 # Check if running interactively and credential file doesn't exist
@@ -134,8 +140,8 @@ if (!(Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory }
 $timestamp = Get-Date -Format "dd-MM-yyyy_HH-mm-ss"
 $logFile = "$logDir\robocopy_$timestamp.txt"
 
-# Define destination root
-$destRoot = "\\vault\Music"
+# Define destination root (may be overridden by -Destination parameter)
+$destRoot = $Destination
 
 # Define exclusions
 $excludeFiles = @("*.bak", "*.backup", "syncthing*.*")      # File patterns to exclude
@@ -282,7 +288,8 @@ foreach ($sourcePath in $folderList) {
                         # Filter out any paths in excluded directories
                         $shouldExclude = $false
                         foreach ($exDir in $excludeDirs) {
-                            if ($copyPath -match [regex]::Escape("\$exDir\")) {
+                            # match the directory name plus trailing backslash
+                            if ($copyPath -match [regex]::Escape("$exDir\")) {
                                 $shouldExclude = $true
                                 break
                             }
