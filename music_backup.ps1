@@ -18,22 +18,25 @@
     Last Updated: 2026-02-26
 
     Changelog:
-        0.01 - Initial PowerShell conversion from batch (https://www.ubackup.com/synchronization/robocopy-multiple-folders-6007-rc.html)
-        0.02 - Added email alerts and logging
-        0.03 - Added dry-run mode and interactive detection
-        0.04 - Added command-line switches for -DryRun and -NoEmail
-        0.05 - Improved logging format and summary
-        0.06 - Added alternate user support for network share access
-        0.07 - Enhanced email function - email credentials are now stored securely, the script will prompt for setup on first run
+        0.0.1 - Initial PowerShell conversion from batch (https://www.ubackup.com/synchronization/robocopy-multiple-folders-6007-rc.html)
+        0.1.0 - Added email alerts and logging
+        0.1.3 - Added dry-run mode and interactive detection
+        0.1.4 - Added command-line switches for -DryRun and -NoEmail
+        0.1.5 - Improved logging format and summary
+        0.2.0 - Added alternate user support for network share access
+        0.2.1 - Enhanced email function - email credentials are now stored securely, the script will prompt for setup on first run
             - Added TLS 1.2 enforcement for SMTP connections
             - Improved folder list handling to ignore comments and empty lines
-        0.08 - Added copied files tracking and attachment to email summary
-        0.09 - Improved handling of spaces in paths and log file encoding (UTF-8 without BOM)
+        0.2.2 - Added copied files tracking and attachment to email summary
+        0.2.3 - Improved handling of spaces in paths and log file encoding (UTF-8 without BOM)
             - added more robust error handling and logging for directory creation and PSDrive mapping
-        0.10 - Added per-run robocopy logs to extract copied files
+        0.2.4 - Added per-run robocopy logs to extract copied files
             - improved filtering of copied files to exclude those matching excluded patterns
             - enhanced email summary with list of copied files and failed folders.
-        1.00 - Added switch for custom destination path, updated documentation and renumbered changelog to reflect feature completeness. This script is now considered stable for regular use.
+        1.0.0 - Added switch for custom destination path, updated documentation and renumbered changelog to reflect feature completeness.
+            - This script is now considered stable for regular use.
+            - Tagged as v1.00 in GitHub repository and published as Release
+        1.0.1 - Added help display when run interactively with no parameters
         #>
 
 
@@ -44,7 +47,49 @@ param (
     [string]$Destination = "\\vault\Music"   # base destination (UNC or drive letter)
 )
 
+# Display help if run interactively with no parameters
+if (($Host.Name -eq "ConsoleHost") -and -not $DryRun -and -not $NoEmail -and -not $AltUser -and $Destination -eq "\\vault\Music") {
+    Write-Host "`n" @"
+╔════════════════════════════════════════════════════════════════════╗
+║                      Music Backup Script v1.00                     ║
+╚════════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION:
+  Synchronizes music folders from local/network sources to a 
+  destination using Robocopy, with optional email alerts. Logs
+  are saved in a subfolder, with timestamped filenames. 
+
+USAGE:
+  .\music_backup.ps1 [options]
+
+OPTIONS:
+  -DryRun               Simulate the backup without copying files
+  -NoEmail              Suppress email notification
+  -AltUser              Use alternate credentials for network share access
+  -Destination <path>   Custom destination path (UNC or drive letter)
+                        Default: \\vault\Music
+
+EXAMPLES:
+  .\music_backup.ps1                               # Run with defaults
+  .\music_backup.ps1 -DryRun                       # Simulate run
+  .\music_backup.ps1 -Destination '\\server\backup' # Custom destination
+  .\music_backup.ps1 -AltUser -NoEmail -DryRun     # Alternate user, no mail, simulate
+
+REQUIREMENTS:
+  • folders.txt in the script directory (list of source folders)
+  • Gmail SMTP requires App Password if 2FA is enabled
+
+FIRST RUN:
+  Run this script from a powershell prompt, you'll be prompted to create an encrypted
+  credential file for email authentication.
+
+For more details, see the comment block at the top of this script.
+"@
+    exit 0
+}
+
 # Check if running interactively and credential file doesn't exist
+
 $emailCredPath = "$PSScriptRoot\email_cred.xml"
 if (($Host.Name -eq "ConsoleHost") -and !(Test-Path $emailCredPath)) {
     Write-Host "`n=== First Run Email Credential Setup ==="
