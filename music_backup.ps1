@@ -7,14 +7,14 @@
 	-DryRun    : simulates backup run without copying files
 	-NoEmail   : suppresses email alerts
     -AltUser   : use alternate user credentials for network share access
-    -Destination <path> : specify a custom destination root (UNC or drive); defaults to \\vault\Music
+    -Destination <path> : specify a custom destination root (UNC or drive); defaults to \\vault\Music. Unix-style: --Destination <path>
 
     Notes:
 	- Requires folders.txt in the script directory
 	- Logs are saved in the 'logs' subfolder
 	- Email alerts use Gmail SMTP (App Password required if 2FA enabled)
 
-    Version: 1.0.3
+    Version: 1.0.4
     Last Updated: 2026-05-14
 
     Changelog:
@@ -43,6 +43,7 @@
             - First run: same restricted ACL for recipient_cred.xml as for email_cred.xml.
             - Robocopy: exit codes as bitmask (fatal bits 8/16); clearer logs for mismatches; 5-7 no longer misclassified as failed.
             - folders.txt line split tolerates CRLF; help banner version aligned to v1.0.3.
+        1.0.4 - Double-dash destination: accept `--Destination <path>` (same style as `--DryRun`, etc.).
         #>
 
 
@@ -55,12 +56,22 @@ param (
 
 # normalize double‑hyphen switches so that --DryRun etc behave like -DryRun
 # this allows Unix-style invocation without breaking normal parameter binding
-foreach ($raw in $args) {
+# --Destination uses the next token as the path (same pattern as other -- switches, no =value form)
+for ($i = 0; $i -lt $args.Count; $i++) {
+    $raw = $args[$i]
     switch -Regex ($raw) {
         '^--DryRun$'    { $DryRun = $true }
         '^--NoEmail$'   { $NoEmail = $true }
         '^--AltUser$'   { $AltUser = $true }
-        '^--Destination=(.+)' { $Destination = $Matches[1] }
+        '^--Destination$' {
+            if (($i + 1) -lt $args.Count) {
+                $next = $args[$i + 1]
+                if ($next -notmatch '^--') {
+                    $Destination = $next
+                    $i++
+                }
+            }
+        }
     }
 }
 
@@ -68,7 +79,7 @@ foreach ($raw in $args) {
 if (($Host.Name -eq "ConsoleHost") -and -not $DryRun -and -not $NoEmail -and -not $AltUser -and $Destination -eq "\\vault\Music") {
     Write-Host "`n" @"
 ╔════════════════════════════════════════════════════════════════════╗
-║                     Music Backup Script v1.0.3                     ║
+║                     Music Backup Script v1.0.4                     ║
 ╚════════════════════════════════════════════════════════════════════╝
 
 DESCRIPTION:
