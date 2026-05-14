@@ -54,7 +54,7 @@ param (
     [string]$Destination = "\\vault\Music"   # base destination (UNC or drive letter)
 )
 
-# normalize double‑hyphen switches so that --DryRun etc behave like -DryRun
+# normalize double-hyphen switches so that --DryRun etc behave like -DryRun
 # this allows Unix-style invocation without breaking normal parameter binding
 # --Destination uses the next token as the path (same pattern as other -- switches, no =value form)
 for ($i = 0; $i -lt $args.Count; $i++) {
