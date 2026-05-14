@@ -10,12 +10,12 @@
     -Destination <path> : specify a custom destination root (UNC or drive); defaults to \\vault\Music
 
     Notes:
-	- Requires folders.txt in the same directory
+	- Requires folders.txt in the script directory
 	- Logs are saved in the 'logs' subfolder
 	- Email alerts use Gmail SMTP (App Password required if 2FA enabled)
 
-    Version: 1.00
-    Last Updated: 2026-02-26
+    Version: 1.0.3
+    Last Updated: 2026-05-14
 
     Changelog:
         0.0.1 - Initial PowerShell conversion from batch (https://www.ubackup.com/synchronization/robocopy-multiple-folders-6007-rc.html)
@@ -37,6 +37,12 @@
             - This script is now considered stable for regular use.
             - Tagged as v1.00 in GitHub repository and published as Release
         1.0.1 - Added help display when run interactively with no parameters
+        1.0.2 - Added configurable email recipient and improved first-run setup instructions.
+        1.0.3 - Post-1.0.2 hardening and behavior fixes.
+            - AltUser: remove mapped PSDrive in try/finally so cleanup runs even on early exit.
+            - First run: same restricted ACL for recipient_cred.xml as for email_cred.xml.
+            - Robocopy: exit codes as bitmask (fatal bits 8/16); clearer logs for mismatches; 5-7 no longer misclassified as failed.
+            - folders.txt line split tolerates CRLF; help banner version aligned to v1.0.3.
         #>
 
 
@@ -62,7 +68,7 @@ foreach ($raw in $args) {
 if (($Host.Name -eq "ConsoleHost") -and -not $DryRun -and -not $NoEmail -and -not $AltUser -and $Destination -eq "\\vault\Music") {
     Write-Host "`n" @"
 ╔════════════════════════════════════════════════════════════════════╗
-║                      Music Backup Script v1.00                     ║
+║                     Music Backup Script v1.0.3                     ║
 ╚════════════════════════════════════════════════════════════════════╝
 
 DESCRIPTION:
@@ -92,7 +98,7 @@ REQUIREMENTS:
 
 FIRST RUN:
   Run this script from a powershell prompt, you'll be prompted to create an encrypted
-  credential file for email authentication.
+  credential file for email sender authentication, and an email recipient for the summary. 
 
 For more details, see the comment block at the top of this script.
 "@
@@ -102,6 +108,7 @@ For more details, see the comment block at the top of this script.
 # Check if running interactively and credential file doesn't exist
 
 $emailCredPath = "$PSScriptRoot\email_cred.xml"
+$recipientCredPath = "$PSScriptRoot\recipient_cred.xml"
 if (($Host.Name -eq "ConsoleHost") -and !(Test-Path $emailCredPath)) {
     Write-Host "`n=== First Run Email Credential Setup ==="
     Write-Host "No email credential file found. Let's create one."
@@ -123,17 +130,31 @@ if (($Host.Name -eq "ConsoleHost") -and !(Test-Path $emailCredPath)) {
     $acl.AddAccessRule($rule)
     Set-Acl $emailCredPath $acl
     
+    # Store recipient email
+    $recipientEmail = Read-Host "Enter email recipient address"
+    $recipientCred = New-Object PSCredential($recipientEmail, [System.Security.SecureString]::new())
+    $recipientCred | Export-Clixml -Path $recipientCredPath
+
+    # Same strict permissions as email_cred.xml (inheritance off, current user read only)
+    $aclRecipient = Get-Acl $recipientCredPath
+    $aclRecipient.SetAccessRuleProtection($true, $false)
+    $ruleRecipient = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "$env:USERDOMAIN\$env:USERNAME", "Read", "Allow")
+    $aclRecipient.AddAccessRule($ruleRecipient)
+    Set-Acl $recipientCredPath $aclRecipient
+    
     Write-Host "Credential file created and secured at: $emailCredPath`n"
+    Write-Host "Recipient email stored at: $recipientCredPath`n"
 }
 
 # If alternate user is requested, map network share
 # Need to run the following from an interactive PowerShell console first:
 # 
 # $securePassword = Read-Host "Enter password" -AsSecureString
-# $securePassword | Export-Clixml -Path "D:\MusicBackup\music_backup_password.xml"
+# $securePassword | Export-Clixml -Path "$PSScriptRoot\music_backup_password.xml"
 
 if ($AltUser) {
-    $credPath = "D:\MusicBackup\music_backup_password.xml"
+    $credPath = "$PSScriptRoot\music_backup_password.xml"
     $sharePath = "\\vault\Music"
 
     function Get-FreeDriveLetter {
@@ -187,8 +208,12 @@ function Write-Log {
     }
 }
 
+# Main work (dot-sourced for script scope; -AltUser uses try/finally to remove PSDrive)
+# Capture script path here; $MyInvocation inside the scriptblock would not refer to this file.
+$thisScriptFile = $MyInvocation.MyCommand.Path
+$MusicBackupMain = {
 # Set script root and log directory
-$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$scriptRoot = Split-Path -Parent $thisScriptFile
 $logDir = Join-Path $scriptRoot "logs"
 if (!(Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory }
 
@@ -245,7 +270,7 @@ Write-Log "=== Robocopy Sync Started: $timestamp ===" $logFile
 $rawFolders = @(Get-Content "$scriptRoot\folders.txt" -Raw -ErrorAction SilentlyContinue)
 $folderList = @()
 if ($rawFolders) {
-    $rawFolders -split "`n" | ForEach-Object {
+    $rawFolders -split '\r?\n' | ForEach-Object {
         $line = $_.Trim()
         # Skip empty lines and comments
         if ($line -and -not $line.StartsWith("#")) {
@@ -322,13 +347,9 @@ foreach ($sourcePath in $folderList) {
         & robocopy.exe @robocopyArgs
         $exitCode = $LASTEXITCODE
 
-        # Robocopy exit codes:
-        # 0 = No files copied (but success - no changes needed)
-        # 1 = Files copied successfully
-        # 2 = Extra files or directories detected (also success indicator)
-        # 3 = Files copied + extra files/dirs
-        # 4 = Mismatched files/dirs detected
-        # 8+ = Serious errors - some files not copied
+        # Robocopy exit codes are a bitmask (see robocopy /?):
+        # 1 = files copied, 2 = extras at dest, 4 = mismatches, 8 = copy failures, 16 = serious error.
+        # Treat 8 or 16 as fatal; combinations of 1/2/4 without 8/16 are still success.
         
         # Extract only files that were actually copied (not already existing)
         if (Test-Path $runLog) {
@@ -368,23 +389,28 @@ foreach ($sourcePath in $folderList) {
             }
         }
 
-        # Log result based on robocopy exit code and files found
-        # Exit codes 1-3 indicate files/directories were copied
-        # Exit code 0 means no files needed copying (already in sync)
-        if ($exitCode -le 4) {
-            if ($exitCode -in @(1, 2, 3)) {
-                # Exit codes 1, 2, or 3 mean files or directories were copied
-                $copiedCount++
-                Write-Log "Copied: $sourcePath -> $destPath (Exit Code: $exitCode, files/folders copied)" $logFile
-            } elseif ($exitCode -eq 0 -or $exitCode -eq 4) {
-                # Exit code 0 = no files copied / already in sync
-                # Exit code 4 = mismatched files (but no actual failures)
-                Write-Log "Synced: $sourcePath -> $destPath (Exit Code: $exitCode, no new files)" $logFile
-            }
-        } else {
+        # Log result based on robocopy bitmask (fatal bits 8 and 16)
+        $robocopyFatal = (($exitCode -band 8) -ne 0) -or (($exitCode -band 16) -ne 0)
+        if ($robocopyFatal) {
             $failedCount++
             $failedFolders += $sourcePath
             Write-Log "FAILED: $sourcePath -> $destPath (Exit Code: $exitCode)" $logFile
+        } else {
+            $hasCopiedFromSource = ($exitCode -band 1) -ne 0
+            $hasExtras = ($exitCode -band 2) -ne 0
+            $hasMismatch = ($exitCode -band 4) -ne 0
+            if ($hasCopiedFromSource -or $hasExtras) {
+                $copiedCount++
+                $detail = @()
+                if ($hasCopiedFromSource) { $detail += 'files copied from source' }
+                if ($hasExtras) { $detail += 'extra files/dirs at destination' }
+                if ($hasMismatch) { $detail += 'mismatched files/dirs' }
+                Write-Log "Copied: $sourcePath -> $destPath (Exit Code: $exitCode; $($detail -join '; '))" $logFile
+            } elseif ($hasMismatch) {
+                Write-Log "Synced: $sourcePath -> $destPath (Exit Code: $exitCode, mismatched files/dirs — review log)" $logFile
+            } else {
+                Write-Log "Synced: $sourcePath -> $destPath (Exit Code: $exitCode, no changes needed)" $logFile
+            }
         }
     } else {
         $skippedCount++
@@ -439,7 +465,15 @@ if (-not ($NoEmail)) {
     if (Test-Path $emailCredPath) {
         $emailCred = Import-Clixml -Path $emailCredPath
         $from = $emailCred.UserName
-        $to = "rbyrnes@gmail.com"  # Keep your existing recipient
+
+        # Load recipient email from file
+        if (Test-Path $recipientCredPath) {
+            $recipientCred = Import-Clixml -Path $recipientCredPath
+            $to = $recipientCred.UserName
+        } else {
+            Write-Error "Recipient email not configured."
+            exit 1
+        }            
         
         $subjectPrefix = if ($DryRun) { "[DRY RUN] " } else { "" }
         if ($failedCount -gt 0) {
@@ -465,12 +499,28 @@ if (-not ($NoEmail)) {
         Write-Error "Email credential file not found at: $emailCredPath"
     }
 }
+}
 
-# Cleanup mapped drive
-if ($AltUser -and $mappedDrive) {
+if ($AltUser) {
     try {
-        Remove-PSDrive -Name $mappedDrive -Force -ErrorAction Stop
-    } catch {
-        Write-Log "Warning: failed to remove PSDrive ${mappedDrive}: $_" $logFile
+        . $MusicBackupMain
     }
+    finally {
+        if ($mappedDrive) {
+            try {
+                Remove-PSDrive -Name $mappedDrive -Force -ErrorAction Stop
+            }
+            catch {
+                if (Test-Path variable:logFile) {
+                    Write-Log "Warning: failed to remove PSDrive ${mappedDrive}: $_" $logFile
+                }
+                else {
+                    Write-Warning "Failed to remove PSDrive ${mappedDrive}: $_"
+                }
+            }
+        }
+    }
+}
+else {
+    . $MusicBackupMain
 }
